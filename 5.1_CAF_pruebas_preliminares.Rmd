@@ -1,0 +1,199 @@
+---
+title: "Tablas EIRD vs Gini - ingreso, vivienda y salud"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(readxl)
+library(ineq)
+library(DepthProc)
+library(tidyr)
+library(tibble)
+library(purrr)
+library(ggplot2)
+library(gt)
+library(gtExtras)
+library(dplyr)
+
+archivo <- "ECAF2019_analisis_variables_v3.xlsx"
+
+vars_num <- c("ingreso_pc", "aporte_rel_edad", "act_fisica_min",
+              "viv_servicios", "educacion", "satisf_salud")
+vars_cat <- c("sit_ocupacional", "tipo_ocupacion", "salud_autoperc", "tenencia")
+vars_all <- c(vars_num, vars_cat)
+```
+
+# Datos (jefes, caso_completo = 1)
+
+```{r datos}
+datos_todos <- read_excel(archivo, sheet = "Base_jefes_cod") %>%
+  filter(caso_completo == 1) %>%
+  filter(is.na(act_fisica_min) | act_fisica_min <= 4200) %>%
+  mutate(pais = factor(pais))
+
+datos_todos %>% count(pais)
+```
+
+# Índices univariados
+
+```{r indices}
+prune_uni <- function(data, lower, upper) {
+  if (lower == 0 && upper == 0) return(data)
+  lower_bound <- if (lower > 0) quantile(data, lower) else min(data) / 2
+  upper_bound <- if (upper > 0) quantile(data, upper) else 2 * max(data)
+  data[data > lower_bound & data < upper_bound]
+}
+
+gini_pruned_uni <- function(data, lower, upper) {
+  ineq(prune_uni(data, lower, upper), type = "Gini")
+}
+
+robust_index_pruned_uni <- function(data, lower, upper) {
+  data_pruned <- prune_uni(data, lower, upper)
+  datos_mat <- matrix(data_pruned, ncol = 1)
+
+  prof <- depthProjection(datos_mat, datos_mat)
+  prof_estan <- prof / sum(prof)
+  prof_mat <- prof_estan %*% t(prof_estan)
+  dist_mat <- as.matrix(dist(data_pruned))
+
+  sum(dist_mat * prof_mat) / (2 * abs(median(data_pruned) + 1))
+}
+
+paises <- levels(datos_todos$pais)
+
+matriz_pais_variable <- function(indice) {
+  sapply(vars_all, function(v) {
+    sapply(paises, function(p) {
+      x <- datos_todos %>% filter(pais == p) %>% pull(.data[[v]])
+      indice(as.numeric(x), 0, 0)
+    })
+  })
+}
+
+mat_gini    <- round(matriz_pais_variable(gini_pruned_uni), 3)
+mat_robusto <- round(matriz_pais_variable(robust_index_pruned_uni), 3)
+```
+
+# Correlación Gini vs EIRD (valores y rankings)
+
+```{r correlaciones}
+correlaciones <- sapply(vars_all, function(v) {
+  g <- mat_gini[, v]
+  r <- mat_robusto[, v]
+  ok <- is.finite(g) & is.finite(r)
+  c(
+    corr_valores  = cor(g[ok], r[ok], method = "pearson"),
+    corr_rankings = cor(g[ok], r[ok], method = "spearman"),
+    n_paises      = sum(ok)
+  )
+})
+
+t(round(correlaciones, 3))
+```
+
+# Tablas por variable
+
+```{r funcion_tabla}
+analisis_tabla <- function(v, alto = 95, ancho = 170) {
+
+  idx <- tibble(pais = rownames(mat_robusto),
+                EIRD = mat_robusto[, v],
+                Gini = mat_gini[, v]) %>%
+    filter(is.finite(EIRD), is.finite(Gini)) %>%
+    mutate(rank_EIRD = rank(EIRD, ties.method = "first"),
+           rank_Gini = rank(Gini, ties.method = "first"),
+           dif_orden = rank_Gini - rank_EIRD) %>%
+    arrange(EIRD)
+
+  carpeta <- normalizePath("plots_tmp", mustWork = FALSE)
+  dir.create(carpeta, showWarnings = FALSE)
+
+  guardar_png <- function(grafico, prefijo, p) {
+    archivo_png <- file.path(carpeta, sprintf("%s_%s_%s.png", prefijo, v, p))
+    ggsave(archivo_png, grafico, width = ancho / 72, height = alto / 72, dpi = 72)
+    archivo_png
+  }
+
+  hacer_plots <- function(p) {
+    x <- datos_todos %>% filter(pais == p, is.finite(.data[[v]])) %>% pull(.data[[v]])
+    dfp <- data.frame(x = x)
+
+    gb <- ggplot(dfp, aes(y = x)) +
+      geom_boxplot(fill = "tomato2", alpha = 0.6, outlier.size = 0.4) +
+      theme_minimal(base_size = 8) +
+      theme(axis.title = element_blank(), axis.text.x = element_blank(),
+            axis.ticks.x = element_blank())
+
+    gh <- ggplot(dfp, aes(x = x)) +
+      geom_histogram(bins = 25, fill = "tomato2", color = "white", alpha = 0.8) +
+      theme_minimal(base_size = 8) +
+      theme(axis.title = element_blank())
+
+    tibble(boxplot    = guardar_png(gb, "box", p),
+           histograma = guardar_png(gh, "hist", p))
+  }
+
+  idx <- bind_cols(idx, map_dfr(idx$pais, hacer_plots))
+
+  idx %>%
+    dplyr::select(pais, boxplot, histograma, EIRD, Gini, rank_EIRD, rank_Gini, dif_orden) %>%
+    gt() %>%
+    gt_img_rows(columns = boxplot,    img_source = "local", height = alto) %>%
+    gt_img_rows(columns = histograma, img_source = "local", height = alto) %>%
+    fmt_number(columns = c(EIRD, Gini), decimals = 3) %>%
+    tab_style(
+      style = list(cell_fill(color = "#F8D7DA"), cell_text(weight = "bold")),
+      locations = cells_body(columns = c(rank_EIRD, rank_Gini, dif_orden),
+                             rows = dif_orden != 0)
+    ) %>%
+    cols_label(pais = "País", boxplot = "Boxplot", histograma = "Histograma",
+               rank_EIRD = "R. EIRD", rank_Gini = "R. Gini", dif_orden = "Δ") %>%
+    cols_width(pais ~ px(80),
+               c(EIRD, Gini, rank_EIRD, rank_Gini, dif_orden) ~ px(80)) %>%
+    cols_align(align = "center",
+               columns = c(EIRD, Gini, rank_EIRD, rank_Gini, dif_orden)) %>%
+    tab_options(table.font.size = px(17), data_row.padding = px(2),
+                table.width = px(850), table.margin.left = px(10),
+                table.margin.right = px(10)) %>%
+    tab_header(title = paste0("Distribución e índices por país — ", v))
+}
+```
+
+## Ingreso per cápita
+
+```{r tabla_ingreso}
+t_ingreso <- analisis_tabla("ingreso_pc")
+t_ingreso
+```
+
+## Índice de vivienda y servicios
+
+```{r tabla_vivienda}
+t_vivienda <- analisis_tabla("viv_servicios")
+t_vivienda
+```
+
+## Satisfacción con la salud
+
+```{r tabla_salud}
+t_salud <- analisis_tabla("satisf_salud")
+t_salud
+```
+
+# Exportar (HTML y PNG)
+
+Para el PNG hace falta `webshot2` (`install.packages("webshot2")`).
+
+```{r exportar, eval=TRUE}
+tablas <- list(tabla_ingreso = t_ingreso, tabla_vivienda = t_vivienda, tabla_salud = t_salud)
+
+for (nombre in names(tablas)) {
+  gtsave(tablas[[nombre]], paste0(nombre, ".html"))
+}
+for (nombre in names(tablas)) {
+  gtsave(tablas[[nombre]], paste0(nombre, ".png"), vwidth = 1000)
+}
+```

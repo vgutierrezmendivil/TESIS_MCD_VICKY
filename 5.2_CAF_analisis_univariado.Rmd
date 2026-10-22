@@ -1,0 +1,191 @@
+---
+title: "CAF - Análisis Univariado"
+output: html_document
+date: "2025-10-01"
+---
+```{r setup, include=FALSE}
+library(ineq)
+library(DepthProc)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+
+prune_uni <- function(data, lower, upper) {
+  if (lower == 0 && upper == 0) return(data)
+  lower_bound <- if (lower > 0) quantile(data, lower) else min(data) / 2
+  upper_bound <- if (upper > 0) quantile(data, upper) else 2 * max(data)
+  data[data > lower_bound & data < upper_bound]
+}
+
+gini_pruned_uni <- function(data, lower, upper) {
+  ineq(prune_uni(data, lower, upper), type = "Gini")
+}
+
+heatmap_corr <- function(df, etiquetas, escala_fill) {
+  corr_long <- melt(cor(df, method = "pearson"))
+
+  ggplot(corr_long, aes(x = Var1, y = Var2, fill = value)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = round(value, 2)), size = 4) +
+    escala_fill +
+    scale_x_discrete(labels = parse(text = etiquetas)) +
+    scale_y_discrete(labels = parse(text = etiquetas)) +
+    coord_fixed(ratio = 0.8) +
+    theme_minimal(base_size = 8) +
+    labs(x = NULL, y = NULL) +
+    theme(
+      axis.text.x = element_text(size = 12),
+      axis.text.y = element_text(size = 12),
+      panel.grid = element_blank(),
+      legend.position = "none"
+    )
+}
+```
+
+```{r}
+datos <- 1:20
+gini_pruned_uni(datos, 0.1, 0.8)
+gini_pruned_uni(datos, 0, 0.8)
+gini_pruned_uni(datos, 0.1, 0)
+gini_pruned_uni(datos, 0, 0)
+```
+
+```{r}
+robust_index_pruned_uni <- function(data, lower, upper) {
+  data_pruned <- prune_uni(data, lower, upper)
+  datos_mat <- matrix(data_pruned, ncol = 1)
+
+  prof <- depth(datos_mat, datos_mat)
+  prof_estan <- prof / sum(prof)
+  prof_mat <- prof_estan %*% t(prof_estan)
+  dist_mat <- as.matrix(dist(data_pruned))
+
+  sum(dist_mat * prof_mat) / (2 * abs(median(data_pruned)))
+}
+```
+
+```{r}
+datos <- 1:20
+robust_index_pruned_uni(datos, 0.1, 0.8)
+robust_index_pruned_uni(datos, 0, 0.8)
+robust_index_pruned_uni(datos, 0.1, 0)
+robust_index_pruned_uni(datos, 0, 0)
+```
+
+```{r}
+archivo <- "ECAF2019_analisis_variables_v3.xlsx"
+datos_crudos <- read_excel(archivo, sheet = "Base_jefes_cod")
+```
+
+```{r}
+dim(datos_crudos)
+```
+
+```{r}
+datos <- datos_crudos %>%
+  dplyr::filter(caso_completo == 1) %>%
+  dplyr::filter(is.na(act_fisica_min) | act_fisica_min <= 4200)
+
+dim(datos)
+```
+
+```{r}
+table(datos$pais)
+```
+
+```{r}
+dfs_por_pais <- split(dplyr::select(datos, ingreso_pc), datos$pais)
+
+for (pais in names(dfs_por_pais)) {
+  if (any(is.na(dfs_por_pais[[pais]]))) {
+    cat("⚠️ Cuidado: hay NA en", pais, "\n")
+  }
+  cat("✅", pais, "tiene", nrow(dfs_por_pais[[pais]]), "registros\n")
+}
+```
+
+```{r}
+orden_paises <- c("Ecuador", "Bolivia", "Uruguay", "Colombia", "Chile", "Mexico",
+                  "Paraguay", "Panama", "Peru", "Brasil", "Argentina")
+
+lista_matrices_ingreso <- lapply(dfs_por_pais[orden_paises],
+                                 function(df) as.numeric(df$ingreso_pc))
+names(lista_matrices_ingreso) <- tolower(orden_paises)
+
+print("Cantidad de registros por DataFrame:")
+print(lengths(lista_matrices_ingreso))
+```
+
+```{r}
+resultados_df <- do.call(rbind, lapply(names(lista_matrices_ingreso), function(pais) {
+  datos_pais <- lista_matrices_ingreso[[pais]]
+
+  tryCatch({
+    data.frame(
+      pais = pais,
+      gini_0.1_0.8 = gini_pruned_uni(datos_pais, 0.1, 0.8),
+      gini_0_0.8 = gini_pruned_uni(datos_pais, 0, 0.8),
+      gini_0.1_0 = gini_pruned_uni(datos_pais, 0.1, 0),
+      gini_0_0 = gini_pruned_uni(datos_pais, 0, 0),
+      gini_006_09 = gini_pruned_uni(datos_pais, 0.06, 0.9),
+      robust_index = robust_index_pruned_uni(datos_pais, 0, 0)
+    )
+  }, error = function(e) {
+    warning(paste("Error al calcular índices para", pais, ":", e$message))
+    NULL
+  })
+})) %>%
+  arrange(robust_index)
+
+resultados_df
+```
+
+```{r}
+etiquetas_indices <- c(
+  "gini_0_0"     = "Gini[0-0]",
+  "gini_0.1_0"   = "Gini[0.1-0]",
+  "gini_0_0.8"   = "Gini[0-0.8]",
+  "gini_006_09"  = "Gini[0.06-0.9]",
+  "gini_0.1_0.8" = "Gini[0.1-0.8]",
+  "robust_index" = "EIRD"
+)
+
+resultados_df %>%
+  dplyr::select(all_of(names(etiquetas_indices))) %>%
+  heatmap_corr(
+    etiquetas_indices,
+    scale_fill_gradient2(low = "tomato2", mid = "white", high = "tomato2",
+                         midpoint = 0, limits = c(-1, 1))
+  )
+```
+
+```{r}
+resultados_df <- resultados_df %>%
+  mutate(across(
+    c(robust_index, gini_0.1_0.8, gini_0_0.8, gini_0.1_0, gini_0_0, gini_006_09),
+    ~ rank(.x, ties.method = "first"),
+    .names = "rank_{.col}"
+  )) %>%
+  arrange(rank_robust_index)
+
+resultados_df
+```
+
+```{r}
+etiquetas_rankings <- c(
+  "rank_gini_0_0"     = "Gini[0-0]",
+  "rank_gini_0.1_0"   = "Gini[0.1-0]",
+  "rank_gini_0_0.8"   = "Gini[0-0.8]",
+  "rank_gini_006_09"  = "Gini[0.06-0.9]",
+  "rank_gini_0.1_0.8" = "Gini[0.1-0.8]",
+  "rank_robust_index" = "EIRD"
+)
+
+resultados_df %>%
+  dplyr::select(all_of(names(etiquetas_rankings))) %>%
+  heatmap_corr(
+    etiquetas_rankings,
+    scale_fill_gradient(low = "white", high = "tomato2", limits = c(0, 1))
+  )
+```

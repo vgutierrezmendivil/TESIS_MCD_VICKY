@@ -1,0 +1,478 @@
+---
+title: "4.2 Simulaciones Multivariadas"
+output: html_document
+date: "2025-05-28"
+---
+
+```{r setup, include=FALSE}
+library(DepthProc)
+library(mev)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(VGAM)
+library(scales)
+library(patchwork)
+
+escalar_por_mediana <- function(datos) {
+  sweep(datos, 2, abs(apply(datos, 2, median, na.rm = TRUE)) + 1, FUN = "/")
+}
+
+suma_pares <- function(matriz) {
+  sum(matriz[upper.tri(matriz)])
+}
+
+semivario <- function(h, scale = 0.5, alpha = 1) {
+  (h / scale)^alpha
+}
+
+simular_pareto_br <- function(n, d, shape) {
+  coord <- matrix(seq(0, 1, length.out = d), ncol = 1)
+  datos_unit <- rmev(
+    n = n,
+    coord = coord,
+    vario = semivario,
+    model = "br",
+    scale = 1,
+    alpha = 1
+  )
+
+  apply(datos_unit, 2, function(u) {
+    qpareto(pmin(pmax(pnorm(u), 1e-10), 1 - 1e-10), shape = shape, 1)
+  })
+}
+
+generar_pareto <- function(d) {
+  function(n, shape) simular_pareto_br(n, d, shape)
+}
+
+generar_con_ruido <- function(d, min = 0, max = 1) {
+  function(n, shape) {
+    datos_pareto <- simular_pareto_br(n, d, shape)
+    ruido <- runif(n, min = min, max = max)
+    cbind(datos_pareto, ruido)
+  }
+}
+
+generar_con_pareto_fijo <- function(d, shapes_fijos) {
+  function(n, shape) {
+    datos_pareto <- simular_pareto_br(n, d, shape)
+    fijos <- lapply(shapes_fijos, function(s) rpareto(n, scale = 1, shape = s))
+    do.call(cbind, c(list(datos_pareto), fijos))
+  }
+}
+
+generar_con_discretas <- function(n, shape) {
+  datos_pareto <- simular_pareto_br(n, 5, shape)
+
+  discretizar <- function(x) {
+    z <- cut(x, breaks = 9, labels = FALSE, include.lowest = TRUE)
+    cambiar <- runif(n) < 0.1
+    z[cambiar] <- sample(1:9, sum(cambiar), replace = TRUE)
+    as.numeric(z)
+  }
+
+  educacion <- discretizar(datos_pareto[, 4])
+  ocupacion <- discretizar(datos_pareto[, 5])
+
+  data.frame(
+    salario = datos_pareto[, 1],
+    riqueza = datos_pareto[, 2],
+    ingreso_familiar = datos_pareto[, 3],
+    educacion = educacion,
+    ocupacion = ocupacion
+  )
+}
+
+calcular_indices_multi <- function(datos) {
+  rob <- robusto_multi(datos)
+  gini <- gini_multi(datos)
+  gini_recortado16 <- gini_multi(datos_recortados_multi(datos, porcentaje = 0.16))
+  gini_recortado10 <- gini_multi(datos_recortados_multi(datos, porcentaje = 0.10))
+  gini_recortado20 <- gini_multi(datos_recortados_multi(datos, porcentaje = 0.20))
+
+  c(rob = rob, gini = gini,
+    gini_recortado10 = gini_recortado10,
+    gini_recortado16 = gini_recortado16,
+    gini_recortado20 = gini_recortado20)
+}
+
+simular_escenario <- function(generar, seed = 123, n = 100, simulations = 100,
+                              shape_values = seq(5, 1.5, length.out = 25)) {
+  set.seed(seed)
+
+  filas <- lapply(shape_values, function(shape) {
+    resultados <- t(vapply(seq_len(simulations), function(i) {
+      calcular_indices_multi(as.matrix(generar(n, shape)))
+    }, numeric(5)))
+    data.frame(shape, resultados)
+  })
+
+  do.call(rbind, filas)
+}
+
+resumir_escenario <- function(resultados) {
+  resultados %>%
+    group_by(shape) %>%
+    summarise(
+      across(where(is.numeric) & !any_of("shape"), mean),
+      .groups = "drop"
+    ) %>%
+    pivot_longer(
+      cols = -shape,
+      names_to = "Indice",
+      values_to = "Valor"
+    ) %>%
+    arrange(desc(shape))
+}
+
+colores_indices <- c(
+  "gini" = "purple4",
+  "gini_recortado16" = "olivedrab",
+  "rob" = "indianred",
+  "gini_recortado10" = "goldenrod3",
+  "gini_recortado20" = "steelblue"
+)
+
+etiquetas_indices <- c(
+  "gini" = "Gini 0",
+  "gini_recortado16" = "Gini 0.16",
+  "rob" = "EIRD",
+  "gini_recortado10" = "Gini 0.1",
+  "gini_recortado20" = "Gini 0.2"
+)
+
+graficar_escenario <- function(principal, referencia = NULL, con_etiquetas = TRUE) {
+  p <- ggplot()
+
+  if (!is.null(referencia)) {
+    p <- p +
+      geom_line(
+        data = referencia,
+        aes(x = shape, y = Valor, group = Indice, color = Indice),
+        alpha = 0.25,
+        linewidth = 1,
+        show.legend = FALSE
+      )
+  }
+
+  p <- p +
+    geom_line(
+      data = principal,
+      aes(x = shape, y = Valor, color = Indice, linetype = Indice),
+      linewidth = 1
+    ) +
+    scale_x_reverse() +
+    scale_y_log10(breaks = scales::log_breaks(n = 6)) +
+    scale_color_manual(name = NULL, values = colores_indices, labels = etiquetas_indices) +
+    scale_linetype_manual(values = rep("solid", 5)) +
+    guides(linetype = "none") +
+    theme_minimal() +
+    theme(
+      panel.grid.minor = element_blank(),
+      legend.title = element_blank()
+    )
+
+  if (con_etiquetas) {
+    p <- p + labs(x = "Shape", y = "Valor del Índice")
+  }
+
+  p
+}
+
+covarianzas_por_shape <- function(generar, shapes = c(4, 3, 2), n = 100, seed = 123) {
+  set.seed(seed)
+  covarianzas <- lapply(shapes, function(shape) cov(generar(n, shape)))
+  names(covarianzas) <- paste0("shape_", shapes)
+  covarianzas
+}
+
+titulo_escenario_1 <- "5 Variables Continuas - Escenario N°1"
+vars_escenario_1 <- c("x_1", "x_2", "x_3", "x_4", "x_5")
+
+etiquetas_theta <- c(shape_4 = "θ = 4", shape_3 = "θ = 3", shape_2 = "θ = 2")
+
+paleta <- c("#FFFDF0", "#FFF1A8", "#FFD166", "#FCB544",
+            "#F77F00", "#E0492F", "#A01818")
+
+fmt <- function(v) {
+  s <- formatC(v, format = "e", digits = 1)
+  gsub("e\\+0*(\\d)", "e\\1", s)
+}
+
+covarianzas_a_df <- function(lista, caso) {
+  do.call(rbind, lapply(names(lista), function(nm) {
+    m <- lista[[nm]]
+    data.frame(fila = as.vector(row(m)), col = as.vector(col(m)),
+               valor = as.vector(m), matriz = nm, caso = caso)
+  }))
+}
+
+panel_caso <- function(d, vlab, mostrar_strip, titulo, tam_titulo) {
+  ggplot(d, aes(x = col, y = fila, fill = pos)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = lbl, color = pos > 0.6), size = 2.0) +
+    scale_fill_gradientn(colours = paleta, limits = c(0, 1), guide = "none") +
+    scale_color_manual(values = c("FALSE" = "black", "TRUE" = "white"),
+                       guide = "none") +
+    scale_x_continuous(breaks = 1:5, labels = vlab) +
+    scale_y_reverse(breaks = 1:5, labels = vlab) +
+    facet_wrap(~ matriz, nrow = 1, labeller = as_labeller(etiquetas_theta)) +
+    coord_fixed() +
+    labs(x = NULL, y = NULL, title = titulo) +
+    theme_minimal() +
+    theme(axis.text = element_text(size = 6),
+          plot.title = element_text(size = tam_titulo, face = "bold"),
+          strip.text = if (mostrar_strip) element_text(size = 9)
+                       else element_blank())
+}
+
+heatmap_covarianzas <- function(cov_a, cov_b, vars_b, titulo_b, tam_titulo) {
+  df <- rbind(covarianzas_a_df(cov_a, titulo_escenario_1),
+              covarianzas_a_df(cov_b, titulo_b))
+
+  df$matriz <- factor(df$matriz, levels = c("shape_4", "shape_3", "shape_2"))
+  df$lbl <- fmt(df$valor)
+  df$pos <- (rank(df$valor) - 1) / (length(df$valor) - 1)
+
+  p1 <- panel_caso(subset(df, caso == titulo_escenario_1), vars_escenario_1,
+                   TRUE, titulo_escenario_1, tam_titulo)
+  p2 <- panel_caso(subset(df, caso == titulo_b), vars_b,
+                   FALSE, titulo_b, tam_titulo)
+
+  barra <- data.frame(y = seq(0, 1, length.out = 200),
+                      fillpos = seq(0, 1, length.out = 200))
+  anota <- data.frame(y = c(0, 1), lab = c(fmt(min(df$valor)), fmt(max(df$valor))))
+
+  p_leg <- ggplot(barra, aes(x = 0, y = y, fill = fillpos)) +
+    geom_tile(width = 0.4) +
+    geom_text(data = anota, aes(x = 0.28, y = y, label = lab),
+              inherit.aes = FALSE, hjust = 0, size = 2.5) +
+    scale_fill_gradientn(colours = paleta, limits = c(0, 1), guide = "none") +
+    scale_x_continuous(limits = c(-0.25, 1.6)) +
+    scale_y_continuous(limits = c(-0.05, 1.05)) +
+    labs(title = "Covarianza") +
+    theme_void() +
+    theme(plot.title = element_text(size = 9, hjust = 0))
+
+  p_leg_box <- (plot_spacer() / p_leg / plot_spacer()) +
+    plot_layout(heights = c(1, 2, 1))
+
+  figura <- (p1 / p2) - p_leg_box + plot_layout(widths = c(7, 1.4))
+
+  print(figura)
+  ggsave("heatmaps.png", width = 11, height = 7, dpi = 150)
+  invisible(figura)
+}
+```
+
+Definición EIRDp
+
+```{r}
+robusto_multi <- function(datos) {
+  datos_escalados <- escalar_por_mediana(datos)
+  profundidad <- depthProjection(datos_escalados, datos_escalados)
+  profundidad_estan <- profundidad / sum(profundidad)
+  distancias <- as.matrix(dist(datos_escalados))
+
+  suma_pares(distancias * outer(profundidad_estan, profundidad_estan)) /
+    (2 * ncol(datos))
+}
+```
+
+Definición Gini Multivariado
+
+```{r}
+gini_multi <- function(datos) {
+  datos_escalados <- escalar_por_mediana(datos)
+  if (ncol(datos_escalados) < 2) {
+    datos_escalados <- cbind(datos_escalados, datos_escalados[, 1])
+  }
+  distancias <- as.matrix(dist(datos_escalados))
+
+  suma_pares(distancias) / (2^ncol(datos) * nrow(datos)^2)
+}
+```
+
+Definición de la función para recortar datos multivariados por profundidad
+
+```{r}
+datos_recortados_multi <- function(data, porcentaje = 0.16) {
+  if (!is.data.frame(data) && !is.matrix(data)) {
+    stop("El input debe ser un data frame o matriz numérica.")
+  }
+  data <- as.matrix(data)
+  profundidades <- depthProjection(data, data)
+  orden <- order(profundidades, decreasing = TRUE)
+  n_conservar <- ceiling((1 - porcentaje) * nrow(data))
+  data[orden[1:n_conservar], , drop = FALSE]
+}
+```
+
+Escenario n° 1 - 5 variables continuas
+
+```{r}
+results_1 <- simular_escenario(generar_pareto(5))
+```
+
+```{r}
+results_long_1 <- resumir_escenario(results_1)
+
+graficar_escenario(results_long_1)
+```
+
+Escenario n° 2 - 4 variables continuas + 1 ruido uniforme
+
+```{r}
+results_2 <- simular_escenario(generar_con_ruido(4, min = 0.5, max = 1.5))
+```
+
+```{r}
+results_long_2 <- resumir_escenario(results_2)
+```
+
+```{r}
+graficar_escenario(results_long_2, referencia = results_long_1, con_etiquetas = FALSE)
+```
+
+Escenario n° 3 - 1 variable continua + 1 ruido normal
+
+```{r}
+results_3 <- simular_escenario(generar_con_ruido(1))
+```
+
+```{r}
+results_long_3 <- resumir_escenario(results_3)
+```
+
+Pareto bivariada referencia 
+
+```{r}
+results_bi <- simular_escenario(generar_pareto(2))
+```
+
+```{r}
+results_long_bi <- resumir_escenario(results_bi)
+```
+
+```{r}
+graficar_escenario(results_long_3, referencia = results_long_bi)
+```
+
+Escenario n°4 - 4 variables continuas + 1 ruido normal
+
+```{r}
+results_4 <- simular_escenario(generar_con_ruido(4))
+```
+
+```{r}
+results_long_4 <- resumir_escenario(results_4)
+```
+
+```{r}
+graficar_escenario(results_long_4, referencia = results_long_1)
+```
+
+Escenario n°5 - 4 variables de pareto multivariada y una variable de shape fijo 3,5
+
+```{r}
+results_5 <- simular_escenario(generar_con_pareto_fijo(4, 3.5))
+```
+
+```{r}
+results_long_5 <- resumir_escenario(results_5)
+```
+
+```{r}
+graficar_escenario(results_long_5, referencia = results_long_1)
+```
+
+Escenario n°6 - 3 variables de pareto multi y 2 de shape fijo 3,5 y 4,5
+
+```{r}
+results_6 <- simular_escenario(generar_con_pareto_fijo(3, c(3.5, 4.5)))
+```
+
+```{r}
+results_long_6 <- resumir_escenario(results_6)
+```
+
+```{r}
+graficar_escenario(results_long_6, referencia = results_long_1)
+```
+
+Escenario n°7 - 3 variables de pareto multi y 2 de shape fijo en 3.5
+
+```{r}
+results_7 <- simular_escenario(generar_con_pareto_fijo(3, c(3.5, 3.5)), seed = 124)
+```
+
+```{r}
+results_long_7 <- resumir_escenario(results_7)
+```
+
+```{r}
+graficar_escenario(results_long_7, referencia = results_long_1)
+```
+
+Escenario n°8 - 3 variables de pareto multi y 2 de shape fijo en 2
+
+```{r}
+results_8 <- simular_escenario(generar_con_pareto_fijo(3, c(2, 2)), seed = 124)
+```
+
+```{r}
+results_long_8 <- resumir_escenario(results_8)
+```
+
+```{r}
+graficar_escenario(results_long_8, referencia = results_long_1)
+```
+
+Escenario n°9 - 3 variables continuas y 2 categóricas
+
+```{r}
+results_9 <- simular_escenario(generar_con_discretas)
+```
+
+```{r}
+results_long_9 <- resumir_escenario(results_9)
+```
+
+```{r}
+graficar_escenario(results_long_9, referencia = results_long_1)
+```
+
+Matrices de covarianzas escenario n°1
+
+```{r}
+covarianzas_1 <- covarianzas_por_shape(generar_pareto(5))
+covarianzas_1
+```
+
+```{r}
+covarianzas_2 <- covarianzas_por_shape(generar_con_ruido(4, min = 0.5, max = 1.5))
+
+heatmap_covarianzas(
+  covarianzas_1, covarianzas_2,
+  vars_b = c("x_1", "x_2", "x_3", "x_4", "x_ruido"),
+  titulo_b = "4 Variables Continuas y 1 de Ruido - Escenario N°2",
+  tam_titulo = 9
+)
+```
+
+Matrices de covarianzas - 2 variables categóricas
+
+```{r}
+covarianzas <- covarianzas_por_shape(generar_con_discretas)
+covarianzas
+```
+
+```{r}
+heatmap_covarianzas(
+  covarianzas_1, covarianzas,
+  vars_b = c("x_1", "x_2", "x_3", "x_cat4", "x_cat5"),
+  titulo_b = "3 Variables Continuas y 2 Categóricas - Escenario N°9",
+  tam_titulo = 11
+)
+```

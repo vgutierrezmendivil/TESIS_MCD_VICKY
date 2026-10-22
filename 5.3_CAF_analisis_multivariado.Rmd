@@ -1,0 +1,186 @@
+---
+title: "CAF - Análisis Multivariado"
+output: html_document
+date: "2026-07-04"
+---
+
+```{r setup, include=FALSE}
+library(DepthProc)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+
+escalar_por_mediana <- function(datos) {
+  sweep(datos, 2, abs(apply(datos, 2, median, na.rm = TRUE)) + 1, FUN = "/")
+}
+
+suma_pares <- function(matriz) {
+  sum(matriz[upper.tri(matriz)])
+}
+
+gini_multi <- function(datos) {
+  datos_escalados <- escalar_por_mediana(datos)
+  if (ncol(datos_escalados) < 2) {
+    datos_escalados <- cbind(datos_escalados, datos_escalados[, 1])
+  }
+  distancias <- as.matrix(dist(datos_escalados))
+
+  suma_pares(distancias) / (2^ncol(datos) * nrow(datos)^2)
+}
+
+robusto_multi <- function(datos) {
+  datos_escalados <- escalar_por_mediana(datos)
+  profundidad <- depthProjection(datos_escalados, datos_escalados)
+  profundidad_estan <- profundidad / sum(profundidad)
+  distancias <- as.matrix(dist(datos_escalados))
+
+  suma_pares(distancias * outer(profundidad_estan, profundidad_estan)) /
+    (2 * ncol(datos))
+}
+
+datos_recortados_multi <- function(data, porcentaje = 0.16) {
+  if (!is.data.frame(data) && !is.matrix(data)) {
+    stop("El input debe ser un data frame o matriz numérica.")
+  }
+  data <- as.matrix(data)
+  profundidades <- depthProjection(data, data)
+  orden <- order(profundidades, decreasing = TRUE)
+  n_conservar <- ceiling((1 - porcentaje) * nrow(data))
+  data[orden[1:n_conservar], , drop = FALSE]
+}
+```
+
+```{r}
+archivo <- "ECAF2019_analisis_variables_v3.xlsx"
+
+vars <- c("ingreso_pc", "educacion", "sit_ocupacional", "tipo_ocupacion",
+          "aporte_rel_edad", "satisf_salud", "salud_autoperc",
+          "act_fisica_min", "tenencia", "viv_servicios")
+```
+
+```{r}
+armar_lista_paises <- function(hoja) {
+  datos <- read_excel(archivo, sheet = hoja) %>%
+    filter(caso_completo == 1) %>%
+    filter(is.na(act_fisica_min) | act_fisica_min <= 4200) %>%
+    dplyr::select(pais, all_of(vars))
+
+  partes <- datos %>% group_by(pais) %>% group_split()
+  nombres <- datos %>% group_by(pais) %>% group_keys() %>% pull(pais)
+
+  lista <- lapply(partes, function(df) {
+    as.matrix(sapply(dplyr::select(df, -pais), as.numeric))
+  })
+  names(lista) <- nombres
+  lista
+}
+```
+
+```{r}
+calcular_indices <- function(lista_paises) {
+  resultados <- do.call(rbind, lapply(names(lista_paises), function(pais) {
+    m <- lista_paises[[pais]]
+
+    tryCatch({
+      gini_full <- gini_multi(m)
+      rob_full  <- robusto_multi(m)
+      gini_10   <- gini_multi(datos_recortados_multi(m, 0.10))
+      gini_16   <- gini_multi(datos_recortados_multi(m, 0.16))
+      gini_20   <- gini_multi(datos_recortados_multi(m, 0.20))
+
+      data.frame(
+        pais       = pais,
+        gini       = gini_full,
+        gini_rec10 = gini_10,
+        gini_rec16 = gini_16,
+        gini_rec20 = gini_20,
+        EIRD       = rob_full
+      )
+    }, error = function(e) {
+      warning(paste("Error en", pais, ":", e$message))
+      NULL
+    })
+  }))
+
+  resultados %>% arrange(EIRD)
+}
+```
+
+```{r}
+heatmap_corr <- function(df_indices, etiquetas) {
+  corr_long <- melt(cor(df_indices, use = "complete.obs", method = "pearson"))
+
+  orden <- names(df_indices)
+  corr_long$Var1 <- factor(corr_long$Var1, levels = orden)
+  corr_long$Var2 <- factor(corr_long$Var2, levels = orden)
+
+  ggplot(corr_long, aes(x = Var1, y = Var2, fill = value)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = round(value, 2)), size = 4) +
+    scale_fill_gradient(low = "white", high = "tomato2", limits = c(0, 1)) +
+    scale_x_discrete(labels = parse(text = etiquetas)) +
+    scale_y_discrete(labels = parse(text = etiquetas)) +
+    theme_minimal(base_size = 8) +
+    labs(x = NULL, y = NULL) +
+    theme(
+      aspect.ratio = 1,
+      plot.margin = margin(60, 60, 60, 60),
+      axis.text.x = element_text(size = 12),
+      axis.text.y = element_text(size = 12),
+      panel.grid = element_blank(),
+      legend.position = "none"
+    )
+}
+
+agregar_rankings <- function(res) {
+  res %>%
+    mutate(across(
+      c(gini, gini_rec10, gini_rec16, gini_rec20, EIRD),
+      ~ rank(.x, ties.method = "first"),
+      .names = "rank_{.col}"
+    ))
+}
+
+etiquetas_rank <- c(
+  "rank_gini"       = "Gini",
+  "rank_gini_rec10" = "Gini[10]",
+  "rank_gini_rec16" = "Gini[16]",
+  "rank_gini_rec20" = "Gini[20]",
+  "rank_EIRD"       = "EIRD"
+)
+
+etiquetas_indices <- c(
+  "gini"       = "Gini",
+  "gini_rec10" = "Gini[10]",
+  "gini_rec16" = "Gini[16]",
+  "gini_rec20" = "Gini[20]",
+  "EIRD"       = "EIRD"
+)
+```
+
+```{r}
+lista_jefes <- armar_lista_paises("Base_jefes_cod")
+
+sapply(lista_jefes, nrow)
+```
+
+```{r}
+set.seed(123)
+resultados_jefes <- calcular_indices(lista_jefes)
+resultados_jefes
+```
+
+```{r}
+resultados_jefes %>%
+  dplyr::select(all_of(names(etiquetas_indices))) %>%
+  heatmap_corr(etiquetas_indices)
+```
+
+```{r}
+resultados_jefes <- agregar_rankings(resultados_jefes)
+
+resultados_jefes %>%
+  dplyr::select(all_of(names(etiquetas_rank))) %>%
+  heatmap_corr(etiquetas_rank)
+```

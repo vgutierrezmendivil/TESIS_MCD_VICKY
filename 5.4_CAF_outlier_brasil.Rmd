@@ -1,0 +1,207 @@
+---
+title: "CAF - Outlier Brasil"
+output: html_document
+date: "2025-10-01"
+---
+```{r setup, include=FALSE}
+library(ineq)
+library(DepthProc)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+
+prune_uni <- function(data, lower, upper) {
+  if (lower == 0 && upper == 0) return(data)
+  lower_bound <- if (lower > 0) quantile(data, lower) else min(data) / 2
+  upper_bound <- if (upper > 0) quantile(data, upper) else 2 * max(data)
+  data[data > lower_bound & data < upper_bound]
+}
+
+gini_pruned_uni <- function(data, lower, upper) {
+  ineq(prune_uni(data, lower, upper), type = "Gini")
+}
+```
+
+```{r}
+datos <- 1:20
+gini_pruned_uni(datos, 0.1, 0.8)
+gini_pruned_uni(datos, 0, 0.8)
+gini_pruned_uni(datos, 0.1, 0)
+gini_pruned_uni(datos, 0, 0)
+```
+
+```{r}
+robust_index_pruned_uni <- function(data, lower, upper) {
+  data_pruned <- prune_uni(data, lower, upper)
+  datos_mat <- matrix(data_pruned, ncol = 1)
+
+  prof <- depth(datos_mat, datos_mat)
+  prof_estan <- prof / sum(prof)
+  prof_mat <- prof_estan %*% t(prof_estan)
+  dist_mat <- as.matrix(dist(data_pruned))
+
+  sum(dist_mat * prof_mat) / (2 * abs(median(data_pruned)))
+}
+```
+
+```{r}
+datos <- 1:20
+robust_index_pruned_uni(datos, 0.1, 0.8)
+robust_index_pruned_uni(datos, 0, 0.8)
+robust_index_pruned_uni(datos, 0.1, 0)
+robust_index_pruned_uni(datos, 0, 0)
+```
+
+```{r}
+archivo <- "ECAF2019_analisis_variables_v3.xlsx"
+datos_crudos <- read_excel(archivo, sheet = "Base_todos_cod")
+```
+
+```{r}
+dim(datos_crudos)
+```
+
+```{r}
+datos <- datos_crudos %>%
+  dplyr::filter(caso_completo == 1)
+
+dim(datos)
+```
+
+```{r}
+table(datos$pais)
+```
+
+```{r}
+dfs_por_pais <- split(dplyr::select(datos, ingreso_pc), datos$pais)
+
+for (pais in names(dfs_por_pais)) {
+  if (any(is.na(dfs_por_pais[[pais]]))) {
+    cat("⚠️ Cuidado: hay NA en", pais, "\n")
+  }
+  cat("✅", pais, "tiene", nrow(dfs_por_pais[[pais]]), "registros\n")
+}
+```
+
+```{r}
+orden_paises <- c("Ecuador", "Bolivia", "Uruguay", "Colombia", "Chile", "Mexico",
+                  "Paraguay", "Panama", "Peru", "Brasil", "Argentina")
+
+lista_matrices_ingreso <- lapply(dfs_por_pais[orden_paises],
+                                 function(df) as.numeric(df$ingreso_pc))
+names(lista_matrices_ingreso) <- tolower(orden_paises)
+
+print("Cantidad de registros por DataFrame:")
+print(lengths(lista_matrices_ingreso))
+```
+
+Ejemplo Outlier
+
+```{r}
+brasil <- lista_matrices_ingreso[["brasil"]]
+brasil_sin_outlier <- brasil[brasil < max(brasil)]
+
+cat("Brasil con outlier: n =", length(brasil),
+    "| max =", max(brasil), "\n")
+cat("Brasil sin outlier: n =", length(brasil_sin_outlier),
+    "| max =", max(brasil_sin_outlier), "\n\n")
+
+gini_con <- gini_pruned_uni(brasil, 0, 0)
+rob_con  <- robust_index_pruned_uni(brasil, 0, 0)
+
+gini_sin <- gini_pruned_uni(brasil_sin_outlier, 0, 0)
+rob_sin  <- robust_index_pruned_uni(brasil_sin_outlier, 0, 0)
+
+resultado_brasil <- data.frame(
+  version = c("Con outlier", "Sin outlier"),
+  gini    = c(gini_con, gini_sin),
+  EIRD    = c(rob_con,  rob_sin)
+)
+
+print(resultado_brasil)
+```
+
+```{r}
+ggplot(data.frame(ingreso_pc = brasil), aes(y = ingreso_pc)) +
+  geom_boxplot(fill = "tomato2", alpha = 0.6, width = 0.4, outlier.size = 1) +
+  labs(y = NULL, x = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+```
+
+```{r}
+resultados_recorte <- do.call(rbind, lapply(names(lista_matrices_ingreso), function(pais) {
+  datos_pais <- lista_matrices_ingreso[[pais]]
+
+  tryCatch({
+    data.frame(
+      pais = pais,
+      gini = gini_pruned_uni(datos_pais, 0.05, 0.95),
+      EIRD = robust_index_pruned_uni(datos_pais, 0.05, 0.95)
+    )
+  }, error = function(e) {
+    warning(paste("Error al calcular índices para", pais, ":", e$message))
+    NULL
+  })
+})) %>%
+  arrange(EIRD)
+
+resultados_recorte
+```
+
+```{r}
+df_full <- do.call(rbind, lapply(names(lista_matrices_ingreso), function(pais) {
+  datos_pais <- lista_matrices_ingreso[[pais]]
+
+  data.frame(
+    pais  = pais,
+    gini  = gini_pruned_uni(datos_pais, 0, 0),
+    i_rob = robust_index_pruned_uni(datos_pais, 0, 0)
+  )
+}))
+
+gini_brasil_so <- resultado_brasil$gini[resultado_brasil$version == "Sin outlier"]
+df_full <- df_full %>%
+  mutate(gini_so = if_else(pais == "brasil", gini_brasil_so, gini))
+
+df_rec <- resultados_recorte %>%
+  transmute(pais = tolower(pais), gini_rec = gini)
+
+df_corr <- df_full %>%
+  left_join(df_rec, by = "pais") %>%
+  dplyr::select(gini, gini_so, gini_rec, i_rob)
+
+matriz_cor <- cor(df_corr, use = "complete.obs", method = "pearson")
+round(matriz_cor, 3)
+```
+
+```{r}
+etiquetas <- c(
+  "gini"     = "Gini",
+  "gini_so"  = "Gini[so]",
+  "gini_rec" = "Gini[rec]",
+  "i_rob"    = "EIRD"
+)
+
+corr_long <- melt(matriz_cor)
+corr_long$Var1 <- factor(corr_long$Var1, levels = names(etiquetas))
+corr_long$Var2 <- factor(corr_long$Var2, levels = names(etiquetas))
+
+ggplot(corr_long, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(value, 3)), size = 4) +
+  scale_fill_gradient(low = "white", high = "tomato2", limits = c(0, 1)) +
+  scale_x_discrete(labels = parse(text = etiquetas)) +
+  scale_y_discrete(labels = parse(text = etiquetas)) +
+  theme_minimal(base_size = 8) +
+  labs(x = NULL, y = NULL) +
+  theme(
+    aspect.ratio = 1,
+    plot.margin = margin(40, 40, 40, 40),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    panel.grid = element_blank(),
+    legend.position = "none"
+  )
+```

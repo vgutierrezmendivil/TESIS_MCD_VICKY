@@ -1,0 +1,338 @@
+---
+title: "4.1 Simulaciones Univariadas"
+output: html_document
+date: "2025-05-28"
+---
+
+Definición Gini Recortado 
+
+```{r setup, include=FALSE}
+library(ineq)
+library(DepthProc)
+library(VGAM)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+prune_uni <- function(data, lower, upper) {
+  if (lower == 0 && upper == 0) return(data)
+  lower_bound <- if (lower > 0) quantile(data, lower) else min(data) / 2
+  upper_bound <- if (upper > 0) quantile(data, upper) else 2 * max(data)
+  data[data > lower_bound & data < upper_bound]
+}
+
+gini_pruned_uni <- function(data, lower, upper) {
+  ineq(prune_uni(data, lower, upper), type = "Gini")
+}
+
+partir_pareto <- function(datos, porc_inf = 0.06, porc_sup = 0.10) {
+  n <- length(datos)
+  ordenados <- sort(datos)
+  n_inf <- floor(porc_inf * n)
+  n_sup <- floor(porc_sup * n)
+  list(
+    inf = ordenados[1:n_inf],
+    central = ordenados[(n_inf + 1):(n - n_sup)],
+    sup = ordenados[(n - n_sup + 1):n]
+  )
+}
+
+transformar_central <- function(f) {
+  function(datos) {
+    partes <- partir_pareto(datos)
+    c(partes$inf, f(partes$central), partes$sup)
+  }
+}
+
+simular_pareto <- function(k_values, indices, transformar = identity,
+                           n = 100, simulations = 1000) {
+  filas <- lapply(k_values, function(k) {
+    resultados <- t(vapply(seq_len(simulations), function(i) {
+      datos <- transformar(rpareto(n, scale = 1, shape = k))
+      vapply(indices, function(f) f(datos), numeric(1))
+    }, numeric(length(indices))))
+    data.frame(k = k, resultados)
+  })
+  do.call(rbind, filas)
+}
+
+simular_bootstrap <- function(k_values, indices, n = 100, simulations = 1000) {
+  filas <- lapply(k_values, function(k) {
+    partes <- partir_pareto(rpareto(n, scale = 1, shape = k))
+    resultados <- t(vapply(seq_len(simulations), function(i) {
+      central_bootstrap <- sample(partes$central,
+                                  size = length(partes$central),
+                                  replace = TRUE)
+      datos <- c(partes$inf, central_bootstrap, partes$sup)
+      vapply(indices, function(f) f(datos), numeric(1))
+    }, numeric(length(indices))))
+    data.frame(k = k, resultados)
+  })
+  do.call(rbind, filas)
+}
+
+resumir_por_k <- function(resultados) {
+  resultados %>%
+    group_by(k) %>%
+    summarise(across(everything(), mean))
+}
+
+a_formato_largo <- function(resumen) {
+  pivot_longer(resumen, cols = -k, names_to = "Indices", values_to = "Value")
+}
+
+graficar_indices <- function(datos, colores, etiquetas, tipos_linea,
+                             referencia = NULL, ylab = "Valor del índice",
+                             linewidth = 1.2, linetype_guia = NULL,
+                             legend_text_size = NULL) {
+  p <- ggplot()
+
+  if (!is.null(referencia)) {
+    p <- p +
+      geom_line(
+        data = referencia,
+        aes(x = k, y = Value, color = Indices, linetype = Indices),
+        alpha = 0.3,
+        linewidth = 1,
+        show.legend = FALSE
+      )
+  }
+
+  p <- p +
+    geom_line(
+      data = datos,
+      aes(x = k, y = Value, color = Indices, linetype = Indices),
+      linewidth = linewidth
+    ) +
+    scale_x_reverse() +
+    scale_color_manual(values = colores, labels = etiquetas) +
+    scale_linetype_manual(values = tipos_linea, labels = etiquetas) +
+    labs(x = "k", y = ylab, color = "Índice", linetype = "Índice") +
+    theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "right",
+      legend.title = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.key.width = unit(1, "cm")
+    )
+
+  if (!is.null(linetype_guia)) {
+    p <- p + guides(color = guide_legend(override.aes = list(linetype = linetype_guia)))
+  }
+
+  if (!is.null(legend_text_size)) {
+    p <- p + theme(legend.text = element_text(size = legend_text_size))
+  }
+
+  p
+}
+
+indices_5 <- list(
+  gini_006_09 = function(x) gini_pruned_uni(x, 0.06, 0.9),
+  gini_0_0 = function(x) gini_pruned_uni(x, 0, 0),
+  indice_robusto_0_0 = function(x) robust_index_pruned_uni(x, 0, 0),
+  gini_0_08 = function(x) gini_pruned_uni(x, 0, 0.8),
+  gini_01_0 = function(x) gini_pruned_uni(x, 0.1, 0)
+)
+indices_3 <- indices_5[c("gini_006_09", "gini_0_0", "indice_robusto_0_0")]
+
+colores_5 <- c(
+  gini_006_09 = "olivedrab",
+  gini_0_0 = "mediumpurple4",
+  indice_robusto_0_0 = "indianred",
+  gini_0_08 = "steelblue",
+  gini_01_0 = "tan3"
+)
+etiquetas_5 <- c(
+  gini_006_09 = "Gini 0.06–0.9",
+  gini_0_0 = "Gini 0–0",
+  indice_robusto_0_0 = "EIRD",
+  gini_0_08 = "Gini 0–0.8",
+  gini_01_0 = "Gini 0.1–0"
+)
+tipos_5 <- c(
+  gini_006_09 = "solid",
+  gini_0_0 = "solid",
+  indice_robusto_0_0 = "dashed",
+  gini_0_08 = "solid",
+  gini_01_0 = "dashed"
+)
+
+colores_3 <- colores_5[1:3]
+etiquetas_3 <- etiquetas_5[1:3]
+tipos_3_eird_punteado <- tipos_5[1:3]
+tipos_3_solidos <- c(
+  gini_006_09 = "solid",
+  gini_0_0 = "solid",
+  indice_robusto_0_0 = "solid"
+)
+
+k_values <- seq(10, 1, length.out = 50)
+```
+
+Prueba Gini Recortado
+
+```{r}
+datos <- 1:20
+gini_pruned_uni(datos, 0.1, 0.8)
+gini_pruned_uni(datos, 0, 0.8)
+gini_pruned_uni(datos, 0.1, 0)
+gini_pruned_uni(datos, 0, 0)
+```
+
+Definición EIRD1
+
+```{r}
+robust_index_pruned_uni <- function(data, lower, upper) {
+  data_pruned <- prune_uni(data, lower, upper)
+  datos_mat <- matrix(data_pruned, ncol = 1)
+
+  prof <- depthProjection(datos_mat, datos_mat)
+  prof_estan <- prof / (sum(prof) + 0.0001)
+  prof_mat <- prof_estan %*% t(prof_estan)
+  dist_mat <- as.matrix(dist(data_pruned))
+
+  sum(dist_mat * prof_mat) / (2 * abs(median(data_pruned)))
+}
+```
+
+Prueba IRD1
+
+```{r}
+datos <- 1:20
+robust_index_pruned_uni(datos, 0.1, 0.8)
+robust_index_pruned_uni(datos, 0, 0.8)
+robust_index_pruned_uni(datos, 0.1, 0)
+robust_index_pruned_uni(datos, 0, 0)
+```
+
+Escenario n° 1: distribución Pareto inalterada
+
+```{r}
+set.seed(123)
+
+results <- simular_pareto(k_values, indices_5)
+results_summary <- resumir_por_k(results)
+results_long_original <- a_formato_largo(results_summary)
+```
+
+```{r}
+graficar_indices(
+  results_long_original,
+  colores = colores_5,
+  etiquetas = etiquetas_5,
+  tipos_linea = tipos_5,
+  ylab = "Índice",
+  linewidth = 1
+)
+```
+
+Escenario n° 2: datos centrales reemplazados por su mediana
+
+```{r}
+set.seed(123)
+
+results_mediana <- simular_pareto(
+  k_values, indices_3,
+  transformar = transformar_central(function(x) rep(median(x), length(x)))
+)
+```
+
+```{r}
+results_summary_mediana <- resumir_por_k(results_mediana)
+results_long_mediana <- a_formato_largo(results_summary_mediana)
+```
+
+```{r}
+graficar_indices(
+  results_long_mediana,
+  colores = colores_3,
+  etiquetas = etiquetas_3,
+  tipos_linea = tipos_3_eird_punteado,
+  referencia = results_long_original,
+  linetype_guia = c("solid", "solid", "dashed")
+)
+```
+
+Escenario n° 3: datos centrales uniformes
+
+```{r}
+set.seed(123)
+
+results_unif <- simular_pareto(
+  k_values, indices_3,
+  transformar = transformar_central(function(x) runif(length(x), min = min(x), max = max(x)))
+)
+```
+
+```{r}
+results_summary_unif <- resumir_por_k(results_unif)
+results_long_unif <- a_formato_largo(results_summary_unif)
+```
+
+```{r}
+graficar_indices(
+  results_long_unif,
+  colores = colores_3,
+  etiquetas = etiquetas_3,
+  tipos_linea = tipos_3_solidos,
+  referencia = results_long_original,
+  linetype_guia = c("solid", "solid", "solid")
+)
+```
+
+Escenario n° 4: datos centrales espejados
+
+```{r}
+set.seed(123)
+
+results_esp <- simular_pareto(
+  seq(10, 0.9, length.out = 50), indices_3,
+  transformar = transformar_central(function(x) {
+    punto_medio <- min(x) + (max(x) - min(x)) / 2
+    2 * punto_medio - x
+  })
+)
+```
+
+```{r}
+results_summary_esp <- resumir_por_k(results_esp)
+results_long_esp <- a_formato_largo(results_summary_esp)
+```
+
+```{r}
+graficar_indices(
+  results_long_esp,
+  colores = colores_3,
+  etiquetas = etiquetas_3,
+  tipos_linea = tipos_3_solidos,
+  referencia = results_long_original,
+  linetype_guia = c("solid", "solid", "solid"),
+  legend_text_size = 11
+)
+```
+
+Escenario n°5: Parte central bootstrapeada
+
+```{r}
+set.seed(123)
+
+results_boot <- simular_bootstrap(k_values, indices_3)
+```
+
+```{r}
+results_summary_boot <- resumir_por_k(results_boot)
+results_long_boot <- a_formato_largo(results_summary_boot)
+```
+
+```{r}
+graficar_indices(
+  results_long_boot,
+  colores = colores_3,
+  etiquetas = etiquetas_3,
+  tipos_linea = tipos_3_solidos,
+  referencia = results_long_original,
+  linetype_guia = c("solid", "solid", "solid"),
+  legend_text_size = 11
+)
+```
